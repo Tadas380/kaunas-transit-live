@@ -1,0 +1,14 @@
+{
+  "name": "kaunas-transit-live",
+  "version": "1.0.0",
+  "description": "Every bus and trolleybus in Kaunas on a live map, with delays and real-time arrival predictions for every stop. Zero dependencies.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node scripts/dev.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=18" },
+  "author": "Tadas Kaziunas (https://github.com/Tadas380)",
+  "license": "MIT"
+}

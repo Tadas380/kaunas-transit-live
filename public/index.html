@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kaunas Transit Live</title>
+<meta name="description" content="Every bus and trolleybus in Kaunas on a live map, with delays and real-time arrival predictions for every stop.">
+<meta name="theme-color" content="#0E1116">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="map" aria-label="Map of Kaunas with live vehicle positions"></div>
+
+<aside class="panel" id="panel">
+  <header class="brand">
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 32 32"><rect x="3" y="5" width="26" height="20" rx="6" fill="#DC3131"/><rect x="7" y="9" width="18" height="7" rx="2" fill="#0E1116"/><circle cx="10" cy="21" r="2" fill="#fff"/><circle cx="22" cy="21" r="2" fill="#fff"/><path d="M8 28h4M20 28h4" stroke="#DC3131" stroke-width="2.5" stroke-linecap="round"/></svg>
+    </div>
+    <div>
+      <h1>Kaunas Transit Live</h1>
+      <div class="status"><span class="pulse" id="pulse"></span><span id="updated">Connecting…</span></div>
+    </div>
+    <button class="icon-btn collapse" id="collapse" type="button" aria-label="Hide panel" title="Hide panel">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="m15 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </header>
+
+  <div class="scroll">
+    <!-- default view: network overview -->
+    <section id="overview">
+      <div class="stats">
+        <div class="stat"><b id="s-vehicles">–</b><span>in service</span><small id="s-split"></small></div>
+        <div class="stat"><b id="s-ontime">–</b><span>on time</span><small>within 1 min early – 3 min late</small></div>
+        <div class="stat"><b id="s-avg">–</b><span>average delay</span><small id="s-late"></small></div>
+      </div>
+
+      <div class="filter">
+        <label class="search"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="m20 20-3.5-3.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <input id="line-search" type="search" placeholder="Line number, e.g. 37" autocomplete="off" inputmode="search" aria-label="Filter by line number"></label>
+        <div class="seg" role="group" aria-label="Colour vehicles by">
+          <button type="button" data-colorby="line" class="on">Line colour</button>
+          <button type="button" data-colorby="delay">Punctuality</button>
+        </div>
+      </div>
+      <div class="lines" id="lines" aria-label="Lines"></div>
+
+      <h2>Running late right now</h2>
+      <ol class="late-list" id="late-vehicles"></ol>
+
+      <h2>Lines with the biggest delays</h2>
+      <ol class="late-list" id="late-lines"></ol>
+
+      <button class="near" id="nearest" type="button">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="currentColor"/><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 1v3M12 20v3M1 12h3M20 12h3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        Departures from my nearest stop
+      </button>
+      <p class="hint">Tip: zoom in to see stops, then tap one for live arrivals.</p>
+    </section>
+
+    <!-- stop view -->
+    <section id="stop-view" hidden>
+      <button class="back" type="button" data-back>← All of Kaunas</button>
+      <h2 class="stop-name" id="stop-name"></h2>
+      <div class="stop-lines" id="stop-lines"></div>
+      <ul class="arrivals" id="arrivals" aria-live="polite"></ul>
+      <p class="legend"><span class="livedot"></span> live prediction from the vehicle's GPS &nbsp;·&nbsp; <span class="clock">◷</span> timetable</p>
+    </section>
+
+    <!-- vehicle view -->
+    <section id="vehicle-view" hidden>
+      <button class="back" type="button" data-back>← All of Kaunas</button>
+      <div class="veh-head" id="veh-head"></div>
+      <dl class="veh-facts" id="veh-facts"></dl>
+    </section>
+  </div>
+
+  <footer class="credits">
+    Live data: <a href="https://www.stops.lt/kaunas/" rel="noopener">Kauno viešasis transportas / stops.lt</a><br>
+    Built by <a href="https://github.com/Tadas380/kaunas-transit-live" rel="noopener">Tadas Kaziunas</a> · unofficial project
+  </footer>
+</aside>
+
+<button class="icon-btn reopen" id="reopen" type="button" hidden aria-label="Show panel">
+  <svg viewBox="0 0 24 24" width="18" height="18"><path d="m9 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+</button>
+
+<div class="toast" id="toast" role="status" hidden></div>
+
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
