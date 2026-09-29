@@ -6,7 +6,7 @@
 
 Every bus and trolleybus in Kaunas on a live map. You can see **how late each one is**, which lines are running worst right now, and **live arrival predictions for all 966 stops**.
 
-**Live demo:** _add your Render link here_
+**Live demo:** (https://kaunas-transit-live.onrender.com)
 
 ![All vehicles in Kaunas on a live map](docs/overview.jpg)
 
