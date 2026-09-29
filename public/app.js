@@ -2,8 +2,8 @@
 "use strict";
 
 const KAUNAS = [54.8985, 23.9036];
-const REFRESH_MS = 10_000;
-const STOP_REFRESH_MS = 15_000;
+const FALLBACK_MS = 5_000;         // polling interval only if the live stream can't connect
+const STOP_REFRESH_MS = 10_000;
 const STOPS_MIN_ZOOM = 15;
 
 // ---------- small helpers ----------
@@ -145,54 +145,153 @@ function refreshMarkerStyles() {
   }
 }
 
+// Live data normally arrives by push (/api/stream) the moment the city publishes it.
+// refreshLive() is the polling fallback for networks that block event streams.
 async function refreshLive() {
   try {
     const r = await fetch("/api/live", { cache: "no-store" });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "Live data unavailable");
-    const data = await r.json();
-    state.live = data;
-    state.lastUpdate = new Date(data.updated);
-    $("#pulse").className = "pulse live";
-    applyVehicles(data.vehicles);
-    renderStats(data.stats);
-    if (state.selectedVehicle) renderVehicle();
+    onLive(await r.json(), false);
   } catch (e) {
     $("#pulse").className = "pulse stale";
     $("#updated").textContent = "Live data paused, retrying…";
   }
 }
 
-// Moves markers smoothly from their old to their new position.
+// fresh = the stream pushed it, which only happens when the city feed changed.
+function onLive(data, fresh = true) {
+  if (state.live && data.updated < state.live.updated) return;          // ignore an older snapshot
+  if (fresh || !state.live || data.updated !== state.live.updated) state.lastUpdate = Date.now();
+  state.live = data;
+  $("#pulse").className = "pulse live";
+  if (state.network) applyVehicles(data.vehicles);
+  renderStats(data.stats);
+  if (state.selectedVehicle) renderVehicle();
+}
+
+function connectStream() {
+  if (!window.EventSource) return;
+  const es = new EventSource("/api/stream");
+  es.addEventListener("live", e => { state.lastStream = Date.now(); try { onLive(JSON.parse(e.data)); } catch {} });
+  es.addEventListener("ping", () => { state.lastStream = Date.now(); });
+  es.onerror = () => {
+    // The browser reconnects by itself; if the server refused the stream, retry later.
+    if (es.readyState === EventSource.CLOSED) setTimeout(connectStream, 30_000);
+  };
+}
+
+// ---------- vehicle motion ----------
+// The feed gives a position every ~5 s. In between, each vehicle keeps moving at its
+// reported speed along its own route line (or straight ahead if it isn't on one),
+// and when a new position arrives the marker glides onto it instead of jumping.
+const MAX_AHEAD_S = 10, STRAIGHT_AHEAD_S = 4, SETTLE_MS = 1500, M_PER_DEG = 111_320;
+const shapeCache = new Map();
+
+function shapeGeo(id) {
+  if (shapeCache.has(id)) return shapeCache.get(id);
+  const pts = state.network && state.network.shapes[id];
+  let g = null;
+  if (pts && pts.length > 1) {
+    const kx = Math.cos(pts[0][0] * Math.PI / 180) * M_PER_DEG, cum = [0];
+    for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot((pts[i][1] - pts[i - 1][1]) * kx, (pts[i][0] - pts[i - 1][0]) * M_PER_DEG));
+    g = { pts, cum, kx };
+  }
+  shapeCache.set(id, g);
+  return g;
+}
+
+// Distance along the route line of the point nearest to (lat, lon), preferring
+// segments that point the way the vehicle is heading (loop routes pass roads twice).
+function locateOnShape(g, lat, lon, bearing) {
+  let best = null;
+  for (let i = 1; i < g.pts.length; i++) {
+    const [ay, ax] = g.pts[i - 1], [by, bx] = g.pts[i];
+    const dx = (bx - ax) * g.kx, dy = (by - ay) * M_PER_DEG, px = (lon - ax) * g.kx, py = (lat - ay) * M_PER_DEG;
+    const len2 = dx * dx + dy * dy, t = len2 ? Math.max(0, Math.min(1, (px * dx + py * dy) / len2)) : 0;
+    let d = Math.hypot(px - t * dx, py - t * dy);
+    if (bearing != null) {
+      const segBearing = (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
+      if (Math.abs(((segBearing - bearing + 540) % 360) - 180) > 100) d += 60;   // wrong direction: penalise
+    }
+    if (!best || d < best.d) best = { d, s: g.cum[i - 1] + t * Math.sqrt(len2) };
+  }
+  return best && best.d < 40 ? best.s : null;
+}
+
+function pointAt(g, s) {
+  let i = 1;
+  while (i < g.cum.length - 1 && g.cum[i] < s) i++;
+  const seg = g.cum[i] - g.cum[i - 1], t = seg ? Math.max(0, Math.min(1, (s - g.cum[i - 1]) / seg)) : 0;
+  const [ay, ax] = g.pts[i - 1], [by, bx] = g.pts[i];
+  return [ay + (by - ay) * t, ax + (bx - ax) * t];
+}
+
+// Where the model says the vehicle is at time `now` (ms), before smoothing.
+function predicted(m, now) {
+  const mo = m.motion, dt = Math.min((now - mo.t0) / 1000, MAX_AHEAD_S);
+  if (!mo.mps) return [mo.lat, mo.lon];
+  if (mo.geo) return pointAt(mo.geo, Math.min(mo.s0 + mo.mps * dt, mo.geo.cum[mo.geo.cum.length - 1]));
+  const d = mo.mps * Math.min(dt, STRAIGHT_AHEAD_S), b = mo.bearing * Math.PI / 180;
+  return [mo.lat + d * Math.cos(b) / M_PER_DEG, mo.lon + d * Math.sin(b) / (M_PER_DEG * Math.cos(mo.lat * Math.PI / 180))];
+}
+
+function setMotion(m, v, now) {
+  const moving = !v.layover && v.speed >= 3 && !reducedMotion();
+  const geo = moving && v.shapeId ? shapeGeo(v.shapeId) : null;
+  const s0 = geo ? locateOnShape(geo, v.lat, v.lon, v.bearing) : null;
+  m.motion = { lat: v.lat, lon: v.lon, t0: now, mps: moving && (s0 != null || v.bearing != null) ? v.speed / 3.6 : 0,
+    bearing: v.bearing, geo: s0 != null ? geo : null, s0 };
+}
+
+const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+const ease = k => (k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
+
 function applyVehicles(vehicles) {
-  const seen = new Set();
-  const moves = [];
+  const seen = new Set(), now = performance.now();
   for (const v of vehicles) {
     seen.add(v.id);
-    const to = L.latLng(v.lat, v.lon);
     let m = state.markers.get(v.id);
     if (!m) {
-      const marker = L.marker(to, { icon: makeIcon(v), keyboard: false, title: `${v.type === "bus" ? "Bus" : "Trolleybus"} ${v.line} → ${v.headsign}` })
+      const marker = L.marker([v.lat, v.lon], { icon: makeIcon(v), keyboard: false, title: `${v.type === "bus" ? "Bus" : "Trolleybus"} ${v.line} → ${v.headsign}` })
         .on("click", () => openVehicle(v.id)).addTo(map);
-      m = { marker, key: iconKey(v) };
+      m = { marker, key: iconKey(v), off: [0, 0], offT0: now };
       state.markers.set(v.id, m);
-    } else {
-      const key = iconKey(v);
-      if (key !== m.key) { m.marker.setIcon(makeIcon(v)); m.key = key; }
-      const from = m.marker.getLatLng();
-      if (from.distanceTo(to) > 1500) m.marker.setLatLng(to);          // teleport after a long gap
-      else if (!from.equals(to)) moves.push([m.marker, from, to]);
+      setMotion(m, v, now);
+      continue;
     }
+    const key = iconKey(v);
+    if (key !== m.key) { m.marker.setIcon(makeIcon(v)); m.key = key; }
+    const shown = m.marker.getLatLng();
+    setMotion(m, v, now);
+    // Glide from where the marker is now onto the new track (unless it jumped far, e.g. after a gap).
+    const [plat, plon] = predicted(m, now), far = map.distance(shown, [plat, plon]) > 1500;
+    m.off = far || reducedMotion() ? [0, 0] : [shown.lat - plat, shown.lng - plon];
+    m.offT0 = now;
   }
   for (const [id, m] of state.markers) if (!seen.has(id)) { m.marker.remove(); state.markers.delete(id); }
-  if (!moves.length || matchMedia("(prefers-reduced-motion: reduce)").matches) return moves.forEach(([mk, , to]) => mk.setLatLng(to));
-  const t0 = performance.now(), dur = 1800;
-  const step = now => {
-    const k = Math.min(1, (now - t0) / dur), e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
-    for (const [mk, a, b] of moves) mk.setLatLng([a.lat + (b.lat - a.lat) * e, a.lng + (b.lng - a.lng) * e]);
-    if (k < 1) requestAnimationFrame(step);
-  };
-  requestAnimationFrame(step);
+  moveMarkers(now, true);
 }
+
+// Positions every marker for time `now`. Markers off-screen are skipped except on a full pass.
+function moveMarkers(now, all = false) {
+  const view = map.getBounds().pad(0.3);
+  for (const m of state.markers.values()) {
+    if (!m.motion) continue;
+    const [lat, lon] = predicted(m, now), k = Math.min(1, (now - m.offT0) / SETTLE_MS), f = 1 - ease(k);
+    const pos = [lat + m.off[0] * f, lon + m.off[1] * f];
+    if (!all && !view.contains(pos) && !view.contains(m.marker.getLatLng())) continue;
+    const cur = m.marker.getLatLng();
+    if (cur.lat !== pos[0] || cur.lng !== pos[1]) m.marker.setLatLng(pos);
+  }
+}
+
+let lastFrame = 0;
+function frame(now) {
+  if (now - lastFrame >= 33) { lastFrame = now; moveMarkers(now); }      // ~30 fps is plenty for map markers
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+map.on("moveend zoomend", () => moveMarkers(performance.now(), true));
 
 function renderStats(s) {
   $("#s-vehicles").textContent = s.inService ?? s.vehicles;
@@ -218,9 +317,14 @@ function renderStats(s) {
 }
 
 setInterval(() => {
+  // Stream silent (blocked by a proxy, or reconnecting): fall back to polling.
+  if (!document.hidden && Date.now() - (state.lastStream || 0) > 12_000 && Date.now() - (state.lastPoll || 0) > FALLBACK_MS) {
+    state.lastPoll = Date.now();
+    refreshLive();
+  }
   if (!state.lastUpdate) return;
   const s = Math.max(0, Math.round((Date.now() - state.lastUpdate) / 1000));
-  if (!$("#pulse").classList.contains("stale")) $("#updated").textContent = `Live · updated ${s < 5 ? "just now" : `${s} s ago`}`;
+  if (!$("#pulse").classList.contains("stale")) $("#updated").textContent = s < 3 ? "Live · updated just now" : `Live · updated ${s} s ago`;
 }, 1000);
 
 // ---------- views ----------
@@ -358,6 +462,6 @@ function applyHash() {
   await loadNetwork();
   await refreshLive();
   applyHash();
-  setInterval(() => { if (!document.hidden) refreshLive(); }, REFRESH_MS);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshLive(); });
+  state.lastStream = Date.now();
+  connectStream();
 })();

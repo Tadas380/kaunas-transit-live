@@ -51,3 +51,24 @@ test("security headers and static file safety", async () => {
   assert.notEqual((await fetch(`${base}/..%2fserver.js`)).status, 200);
   assert.equal((await fetch(`${base}/api/live`, { method: "POST" })).status, 405);
 });
+
+test("GET /api/stream pushes the live snapshot as Server-Sent Events", async () => {
+  const ac = new AbortController();
+  const r = await fetch(`${base}/api/stream`, { signal: ac.signal });
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type"), /^text\/event-stream/);
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  while (!/event: live\n[^]*?\n\n/.test(buf)) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+  }
+  assert.equal((await (await fetch(`${base}/api/health`)).json()).streamClients, 1, "the open stream stays registered");
+  ac.abort();
+  const data = JSON.parse(buf.match(/event: live\nid: \d+\ndata: (.*)\n\n/)[1]);
+  assert.equal(data.vehicles.length, 11);
+  assert.equal(data.stats.vehicles, 11);
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal((await (await fetch(`${base}/api/health`)).json()).streamClients, 0, "closed streams are cleaned up");
+});

@@ -2,6 +2,8 @@
 //  - loads the official Kaunas GTFS timetable at start-up and once a day
 //  - fetches the live GPS feed from stops.lt (cached for a few seconds, so any
 //    number of viewers causes at most one upstream request per interval)
+//  - pushes every new live snapshot to open maps (Server-Sent Events) the
+//    moment the city publishes it (the feed itself changes about every 5 s)
 //  - serves the map, the network (routes, stops, shapes), live vehicles and
 //    arrival predictions per stop
 // Start with:  node server.js
@@ -20,7 +22,10 @@ const GPS_URL = process.env.GPS_URL || "https://www.stops.lt/kaunas/gps_full.txt
 const GTFS_FILE = process.env.GTFS_FILE || "";      // offline development: a local gtfs.zip
 const GPS_FILE = process.env.GPS_FILE || "";        // offline development: a saved gps_full.txt
 const FIXED_TIME = process.env.FIXED_TIME || "";    // offline development: pretend it's this ISO time
-const LIVE_TTL_MS = 8_000;
+const LIVE_TTL_MS = 2_500;         // /api/live answers from cache for this long
+const POLL_MS = 3_000;             // upstream check interval while someone is watching the stream
+const HEARTBEAT_MS = 10_000;       // tells the page the stream is alive and keeps proxies from closing it
+const MAX_STREAM_CLIENTS = 1_000;
 const PUBLIC_DIR = path.join(__dirname, "public");
 
 const now = () => (FIXED_TIME ? new Date(FIXED_TIME) : new Date());
@@ -59,7 +64,7 @@ function buildNetwork(g) {
 }
 
 // ---------- live feed ----------
-let lastLive = null, inflight = null;
+let lastLive = null, inflight = null, liveVersion = 0;
 
 async function getLive() {
   if (lastLive && Date.now() - lastLive.fetchedAt < LIVE_TTL_MS) return lastLive;
@@ -67,26 +72,70 @@ async function getLive() {
   inflight = (async () => {
     try {
       const text = GPS_FILE ? fs.readFileSync(GPS_FILE, "utf8") : (await fetchBuffer(GPS_URL, 10_000)).toString("utf8");
+      // Unchanged feed: keep the matched snapshot, so nothing is re-sent to the stream.
+      if (lastLive && lastLive.text === text) { lastLive.fetchedAt = Date.now(); return lastLive; }
       const local = localParts(now());
       const serviceDays = gtfs ? gtfs.serviceDays(local) : [];
       const vehicles = live.parseGps(text);
       if (gtfs) live.matchTrips(vehicles, gtfs, serviceDays);
-      lastLive = {
-        fetchedAt: Date.now(), local, serviceDays, vehicles,
-        json: zipped(JSON.stringify({
-          updated: now().toISOString(), localSecs: local.secs,
-          vehicles: vehicles.map(v => live.publicVehicle(v, gtfs)),
-          stats: live.stats(vehicles, gtfs),
-        })),
-      };
+      const body = JSON.stringify({
+        updated: now().toISOString(), localSecs: local.secs,
+        vehicles: vehicles.map(v => live.publicVehicle(v, gtfs)),
+        stats: live.stats(vehicles, gtfs),
+      });
+      lastLive = { fetchedAt: Date.now(), text, version: ++liveVersion, local, serviceDays, vehicles, body, json: zipped(body) };
       return lastLive;
     } catch (e) {
       log("live feed error:", e.message);
       if (lastLive) return lastLive;                                  // serve the last good data
       throw e;
-    } finally { inflight = null; }
-  })();
+    }
+  })().finally(() => { inflight = null; });                          // cleared after assignment, even if it finished instantly
   return inflight;
+}
+
+// ---------- live stream (Server-Sent Events) ----------
+// One upstream poll serves every open map. Polling only runs while at least one
+// map is connected, and a snapshot is pushed only when the feed has changed.
+const streamClients = new Set();
+let pollTimer = null, heartbeatTimer = null;
+
+function sendEvent(client, data) {
+  client.out.write(`event: live\nid: ${data.version}\ndata: ${data.body}\n\n`);
+  client.version = data.version;
+}
+
+async function pollAndBroadcast() {
+  let l;
+  try { l = await getLive(); } catch { return; }
+  for (const c of streamClients) if (c.version !== l.version) sendEvent(c, l);
+}
+
+function openStream(req, res) {
+  if (streamClients.size >= MAX_STREAM_CLIENTS) return sendJson(req, res, 503, { error: "Too many viewers right now." });
+  const gzip = /\bgzip\b/.test(req.headers["accept-encoding"] || "");
+  res.writeHead(200, {
+    ...SECURITY_HEADERS, "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store",
+    "X-Accel-Buffering": "no", Connection: "keep-alive", Vary: "Accept-Encoding",
+    ...(gzip ? { "Content-Encoding": "gzip" } : {}),
+  });
+  // gzip with a flush after every write: each snapshot is ~60 KB of JSON, ~8 KB compressed.
+  let out = res;
+  if (gzip) { out = zlib.createGzip({ flush: zlib.constants.Z_SYNC_FLUSH }); out.pipe(res); }
+  const client = { out, version: 0 };
+  streamClients.add(client);
+  out.write("retry: 3000\n\n");
+  if (lastLive) sendEvent(client, lastLive);                            // show something immediately
+  pollAndBroadcast();
+  if (!pollTimer) {
+    pollTimer = setInterval(pollAndBroadcast, POLL_MS);
+    heartbeatTimer = setInterval(() => { for (const c of streamClients) c.out.write("event: ping\ndata: \n\n"); }, HEARTBEAT_MS);
+  }
+  res.on("close", () => {                                             // the viewer left
+    streamClients.delete(client);
+    if (gzip) out.end();
+    if (!streamClients.size) { clearInterval(pollTimer); clearInterval(heartbeatTimer); pollTimer = heartbeatTimer = null; }
+  });
 }
 
 // ---------- HTTP ----------
@@ -136,6 +185,7 @@ const server = http.createServer(async (req, res) => {
       if (!networkJson) return sendJson(req, res, 503, { error: "The timetable is still loading. Try again in a few seconds." });
       return sendJson(req, res, 200, networkJson, 3600);
     }
+    if (url.pathname === "/api/stream") return openStream(req, res);
     if (url.pathname === "/api/live") {
       const l = await getLive();
       return sendJson(req, res, 200, l.json);
@@ -150,7 +200,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(req, res, 200, { stop: { id: stop.id, name: stop.name, lat: stop.lat, lon: stop.lon }, localSecs: l.local.secs, arrivals });
     }
     if (url.pathname === "/api/health") {
-      return sendJson(req, res, 200, { ok: true, timetable: gtfsLoadedAt, liveAgeSec: lastLive ? Math.round((Date.now() - lastLive.fetchedAt) / 1000) : null });
+      return sendJson(req, res, 200, { ok: true, timetable: gtfsLoadedAt, liveAgeSec: lastLive ? Math.round((Date.now() - lastLive.fetchedAt) / 1000) : null, streamClients: streamClients.size });
     }
     return serveStatic(res, url.pathname);
   } catch (e) {
