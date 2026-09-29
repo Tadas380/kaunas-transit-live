@@ -50,6 +50,10 @@ test("security headers and static file safety", async () => {
     assert.ok(r.headers.get(h), h);
   assert.notEqual((await fetch(`${base}/..%2fserver.js`)).status, 200);
   assert.equal((await fetch(`${base}/api/live`, { method: "POST" })).status, 405);
+  // app files are revalidated so a new deploy is picked up at once
+  const js = await fetch(`${base}/app.js`);
+  assert.equal(js.headers.get("cache-control"), "no-cache");
+  assert.equal((await fetch(`${base}/app.js`, { headers: { "If-None-Match": js.headers.get("etag") } })).status, 304);
 });
 
 test("GET /api/stream pushes the live snapshot as Server-Sent Events", async () => {

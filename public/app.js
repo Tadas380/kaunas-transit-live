@@ -181,10 +181,13 @@ function connectStream() {
 }
 
 // ---------- vehicle motion ----------
-// The feed gives a position every ~5 s. In between, each vehicle keeps moving at its
-// reported speed along its own route line (or straight ahead if it isn't on one),
-// and when a new position arrives the marker glides onto it instead of jumping.
-const MAX_AHEAD_S = 10, STRAIGHT_AHEAD_S = 4, SETTLE_MS = 1500, M_PER_DEG = 111_320;
+// The feed is republished every ~5 s, but each vehicle only reports a new position
+// every 5-17 s. In between, each vehicle keeps moving at its reported speed along its
+// own route line (or straight ahead if it isn't on one). When a new position arrives:
+//  - unchanged report: keep moving as before (don't snap back to the old position)
+//  - vehicle is behind where we drew it: slow down until it catches up, never reverse
+//  - vehicle is ahead: glide forward onto it
+const MAX_AHEAD_S = 15, CATCH_UP_S = 8, STRAIGHT_AHEAD_S = 4, SETTLE_MS = 1500, M_PER_DEG = 111_320;
 const shapeCache = new Map();
 
 function shapeGeo(id) {
@@ -230,7 +233,11 @@ function pointAt(g, s) {
 function predicted(m, now) {
   const mo = m.motion, dt = Math.min((now - mo.t0) / 1000, MAX_AHEAD_S);
   if (!mo.mps) return [mo.lat, mo.lon];
-  if (mo.geo) return pointAt(mo.geo, Math.min(mo.s0 + mo.mps * dt, mo.geo.cum[mo.geo.cum.length - 1]));
+  if (mo.geo) {
+    let s = mo.s0 + mo.mps * dt;
+    if (mo.hold != null) s = Math.max(s, mo.hold + mo.mps * mo.slow * dt);  // ahead of the report: creep on slowly
+    return pointAt(mo.geo, Math.min(s, mo.geo.cum[mo.geo.cum.length - 1]));
+  }
   const d = mo.mps * Math.min(dt, STRAIGHT_AHEAD_S), b = mo.bearing * Math.PI / 180;
   return [mo.lat + d * Math.cos(b) / M_PER_DEG, mo.lon + d * Math.sin(b) / (M_PER_DEG * Math.cos(mo.lat * Math.PI / 180))];
 }
@@ -261,8 +268,22 @@ function applyVehicles(vehicles) {
     }
     const key = iconKey(v);
     if (key !== m.key) { m.marker.setIcon(makeIcon(v)); m.key = key; }
-    const shown = m.marker.getLatLng();
+    if (m.motion && m.motion.lat === v.lat && m.motion.lon === v.lon) continue;   // no new report for this vehicle
+    const shown = m.marker.getLatLng(), prevGeo = m.motion && m.motion.geo;
     setMotion(m, v, now);
+    const mo = m.motion;
+    if (mo.geo && mo.geo === prevGeo) {
+      const sShown = locateOnShape(mo.geo, shown.lat, shown.lng, null), ahead = sShown == null ? -1 : sShown - mo.s0;
+      if (ahead > 0 && ahead < 250) {
+        // Drawn ahead of the real position: continue from where it is, slower, until the real track catches up.
+        mo.hold = sShown;
+        mo.slow = Math.max(0.15, 1 - ahead / (mo.mps * CATCH_UP_S));
+        m.off = [0, 0]; m.offT0 = now;
+        const [hlat, hlon] = predicted(m, now);
+        m.off = [shown.lat - hlat, shown.lng - hlon];                     // sub-metre projection difference only
+        continue;
+      }
+    }
     // Glide from where the marker is now onto the new track (unless it jumped far, e.g. after a gap).
     const [plat, plon] = predicted(m, now), far = map.distance(shown, [plat, plon]) > 1500;
     m.off = far || reducedMotion() ? [0, 0] : [shown.lat - plat, shown.lng - plon];

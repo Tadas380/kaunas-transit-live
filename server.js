@@ -164,14 +164,21 @@ function sendJson(req, res, status, body, maxAge = 0) {
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
   ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".txt": "text/plain; charset=utf-8", ".json": "application/json" };
 
-function serveStatic(res, pathname) {
+// The app's own files are revalidated on every load (ETag), so a new deploy shows up
+// immediately; the Leaflet library never changes and is cached for a week.
+function serveStatic(req, res, pathname) {
   const file = path.normalize(path.join(PUBLIC_DIR, pathname === "/" ? "index.html" : decodeURIComponent(pathname)));
   if (!file.startsWith(PUBLIC_DIR + path.sep)) { res.writeHead(403, SECURITY_HEADERS); return res.end("Forbidden"); }
-  fs.readFile(file, (err, buf) => {
-    if (err) { res.writeHead(404, { ...SECURITY_HEADERS, "Content-Type": "text/plain" }); return res.end("Not found"); }
-    const cache = /\/vendor\//.test(file) ? "public, max-age=604800" : "public, max-age=300";
-    res.writeHead(200, { ...SECURITY_HEADERS, "Content-Type": MIME[path.extname(file)] || "application/octet-stream", "Cache-Control": cache });
-    res.end(buf);
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) { res.writeHead(404, { ...SECURITY_HEADERS, "Content-Type": "text/plain" }); return res.end("Not found"); }
+    const etag = `"${st.size.toString(36)}-${Math.round(st.mtimeMs).toString(36)}"`;
+    const headers = { ...SECURITY_HEADERS, ETag: etag, "Cache-Control": /\/vendor\//.test(file) ? "public, max-age=604800" : "no-cache" };
+    if (req.headers["if-none-match"] === etag) { res.writeHead(304, headers); return res.end(); }
+    fs.readFile(file, (err2, buf) => {
+      if (err2) { res.writeHead(500, SECURITY_HEADERS); return res.end(); }
+      res.writeHead(200, { ...headers, "Content-Type": MIME[path.extname(file)] || "application/octet-stream" });
+      res.end(buf);
+    });
   });
 }
 
@@ -202,7 +209,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/health") {
       return sendJson(req, res, 200, { ok: true, timetable: gtfsLoadedAt, liveAgeSec: lastLive ? Math.round((Date.now() - lastLive.fetchedAt) / 1000) : null, streamClients: streamClients.size });
     }
-    return serveStatic(res, url.pathname);
+    return serveStatic(req, res, url.pathname);
   } catch (e) {
     log("request error:", e.message);
     return sendJson(req, res, 502, { error: "Live data is temporarily unavailable. The map will retry automatically." });
